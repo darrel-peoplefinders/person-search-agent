@@ -6,7 +6,7 @@ from uuid import uuid4
 import time
 import logging
 
-from api.index import (
+from api.main import (
     person_search_agent,
     create_initial_context,
 )
