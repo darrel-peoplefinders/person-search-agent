@@ -457,17 +457,22 @@ def enformion_to_search_result(enformion_result: EnformionResult, search_context
             if name:
                 relatives.append(name)
     
-    # Generate story-based timeline analysis
+    # Generate accurate timeline analysis
     timeline_match = _generate_timeline_analysis(enformion_result, search_context)
     
-    # Extract professional background
+    # Professional background - only show if we have real data
     professional_background = ""
-    if enformion_result.employment_history:
+    if enformion_result.employment_history and len(enformion_result.employment_history) > 0:
         latest_job = enformion_result.employment_history[0]
         company = latest_job.get("company", "")
         title = latest_job.get("title", "")
-        if company or title:
-            professional_background = f"{title} at {company}".strip(" at ")
+        if company and title:
+            professional_background = f"{title} at {company}"
+        elif company:
+            professional_background = f"Works at {company}"
+        elif title:
+            professional_background = title
+    # If no employment history, leave empty - don't make up fake data
     
     return {
         "id": enformion_result.id,
@@ -480,125 +485,63 @@ def enformion_to_search_result(enformion_result: EnformionResult, search_context
         "previous_addresses": previous_locations,
         "relatives": relatives,
         "timeline_match": timeline_match,
-        "professional_background": professional_background,
+        "professional_background": professional_background,  # Will be empty if no real data
         "phone_numbers": enformion_result.phone_numbers or [],
         "email_addresses": enformion_result.email_addresses or []
     }
 
 def _generate_timeline_analysis(result: EnformionResult, search_context: dict = None) -> str:
     """
-    Generate a timeline analysis string that tells the story of this person
-    matching the user's search context
+    Generate accurate timeline analysis based on graduation year and search context
     """
-    analysis_parts = []
+    if not search_context:
+        return f"Age {result.age} - no additional timeline context available"
     
-    # Extract search context for story-telling
-    relationship = search_context.get("relationship", "") if search_context else ""
-    additional_context = search_context.get("additional_context", "") if search_context else ""
-    first_name = search_context.get("first_name", "") if search_context else ""
+    additional_context = search_context.get("additional_context", "")
+    relationship = search_context.get("relationship", "")
     
-    # Base age/timeline analysis
-    if result.age:
-        analysis_parts.append(f"At age {result.age}, this matches your expected timeline")
+    # Extract graduation year from context
+    import re
+    grad_match = re.search(r'graduated.*?(\d{4})', additional_context)
     
-    # Story-based geographic analysis
-    if result.current_address and result.previous_addresses:
-        current_state = result.current_address.get("state", "")
-        current_city = result.current_address.get("city", "")
+    if grad_match:
+        graduation_year = int(grad_match.group(1))
+        current_year = 2025
         
-        # Look for meaningful patterns in address history
-        prev_states = [addr.get("state") for addr in result.previous_addresses if addr.get("state")]
-        prev_cities = [addr.get("city") for addr in result.previous_addresses if addr.get("city")]
-        
-        # Build the story
-        if "college" in relationship.lower() and "2010" in additional_context:
-            if "CA" in prev_states and current_state != "CA":
-                analysis_parts.append(f"This person lived in California around the time you went to college together, then moved to {current_state}")
-            elif "Los Angeles" in prev_cities or "LA" in prev_cities:
-                analysis_parts.append(f"This person has Los Angeles in their address history, matching your UCLA connection")
-        
-        elif "high school" in relationship.lower() and "1993" in additional_context:
-            if len(prev_states) > 0:
-                analysis_parts.append(f"Geographic movement from {prev_states[0]} fits the timeline since high school graduation")
-        
-        # Marriage and name change detection
-        if len(set(prev_states)) > 1:
-            analysis_parts.append(f"Multiple state moves suggest major life changes like marriage or career")
-    
-    # Professional background story
-    if result.employment_history:
-        latest_job = result.employment_history[0]
-        company = latest_job.get("company", "")
-        if company:
-            analysis_parts.append(f"Professional background at {company} indicates career progression since college")
-    
-    # Education verification
-    if result.education_history:
-        analysis_parts.append(f"Education history available for verification against your {relationship} connection")
-    
-    # Default if no specific patterns found
-    if not analysis_parts:
-        if relationship and first_name:
-            return f"This {first_name} profile shows life patterns consistent with your {relationship} search"
+        # Determine graduation type and expected age
+        if "high school" in additional_context.lower():
+            # High school graduation typically at age 17-18
+            expected_age = current_year - graduation_year + 18
+            graduation_type = "high school"
+        elif "college" in additional_context.lower():
+            # College graduation typically at age 21-22
+            expected_age = current_year - graduation_year + 22
+            graduation_type = "college"
         else:
-            return "Basic information matches search criteria"
+            # Default to college if not specified
+            expected_age = current_year - graduation_year + 22
+            graduation_type = "graduation"
+        
+        age_difference = abs(result.age - expected_age)
+        
+        # Generate accurate analysis
+        if age_difference <= 2:
+            return f"At age {result.age}, this perfectly matches your expected timeline. Someone who graduated {graduation_type} in {graduation_year} would be around {expected_age} now."
+        elif result.age < expected_age - 2:
+            years_too_young = expected_age - result.age
+            return f"At age {result.age}, this person is likely too young. Someone who graduated {graduation_type} in {graduation_year} would be around {expected_age} now - this is {years_too_young} years younger than expected. NOT A LIKELY MATCH."
+        else:
+            years_too_old = result.age - expected_age
+            return f"At age {result.age}, this person is older than expected. Someone who graduated {graduation_type} in {graduation_year} would be around {expected_age} now - this is {years_too_old} years older than expected. Possible but less likely match."
     
-    return ". ".join(analysis_parts)
-
-# =========================
-# Mock Data for Testing
-# =========================
-
-def create_mock_enformion_results(params: PersonSearchParams) -> EnformionResponse:
-    """
-    Create mock results for testing when EnformionGo API is not available
-    """
-    mock_results = [
-        EnformionResult(
-            id="mock_1",
-            confidence_score=0.87,
-            first_name=params.first_name,
-            last_name=params.last_name,
-            age=32,
-            current_address={"city": params.city or "Denver", "state": params.state or "CO"},
-            previous_addresses=[
-                {"city": "Austin", "state": "TX"},
-                {"city": "College Station", "state": "TX"}
-            ],
-            relatives=[
-                {"first_name": "John", "last_name": params.last_name},
-                {"first_name": "Mary", "last_name": params.last_name}
-            ],
-            employment_history=[
-                {"company": "Tech Corp", "title": "Marketing Manager", "years": "2020-Present"}
-            ],
-            education_history=[
-                {"school": "Texas A&M University", "degree": "Bachelor's", "year": "2015"}
-            ]
-        ),
-        EnformionResult(
-            id="mock_2",
-            confidence_score=0.64,
-            first_name=params.first_name,
-            last_name=params.last_name,
-            age=35,
-            current_address={"city": "Colorado Springs", "state": "CO"},
-            previous_addresses=[
-                {"city": "Phoenix", "state": "AZ"}
-            ],
-            relatives=[
-                {"first_name": "Robert", "last_name": params.last_name}
-            ],
-            employment_history=[
-                {"company": "School District", "title": "Teacher", "years": "2018-Present"}
-            ]
-        )
-    ]
+    # Handle other relationship contexts without graduation year
+    if "college" in relationship.lower():
+        if result.age < 25:
+            return f"At age {result.age}, this person is likely too young to be a college friend."
+        elif result.age > 65:
+            return f"At age {result.age}, this person might be older than expected for a college connection."
+        else:
+            return f"At age {result.age}, this could match your college timeline."
     
-    return EnformionResponse(
-        success=True,
-        total_results=len(mock_results),
-        results=mock_results,
-        query_id="mock_query_123",
-        credits_used=1
-    )
+    # Default analysis
+    return f"Age {result.age} - timeline analysis needs more graduation year context"

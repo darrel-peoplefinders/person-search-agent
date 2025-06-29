@@ -144,7 +144,7 @@ async def update_search_criteria(
 async def search_person(
     context: RunContextWrapper[PersonSearchContext]
 ) -> str:
-    """Search for a person using EnformionGo API."""
+    """Search for a person using EnformionGo API - REAL DATA ONLY."""
     ctx = context.context
     
     if not ctx.search_ready:
@@ -163,114 +163,163 @@ async def search_person(
         previous_locations=ctx.previous_locations
     )
     
-    # Try to use real EnformionGo API, fall back to mock data
+    # ONLY use real EnformionGo API - no fallback to mock data
     enformion_client = create_enformion_client()
     
-    if enformion_client:
-        try:
-            # Make real API call - get FULL data but control what we show
-            response = await enformion_client.search_person(search_params)
-            await enformion_client.close()
-            
-            if response.success:
-                # Convert EnformionGo results to our format with search context for story-telling
-                search_context = {
-                    "relationship": ctx.relationship,
-                    "additional_context": ctx.additional_context, 
-                    "first_name": ctx.first_name
-                }
-                search_results = [
-                    enformion_to_search_result(result, search_context) 
-                    for result in response.results
-                ]
-                ctx.last_query_id = response.query_id
-            else:
-                return f"Search failed: {response.error_message}"
-                
-        except Exception as e:
-            # Fall back to mock data on API error
-            response = create_mock_enformion_results(search_params)
-            search_results = [
-                enformion_to_search_result(result) 
-                for result in response.results
-            ]
-            ctx.last_query_id = response.query_id
-    else:
-        # Use mock data when API key not available
-        response = create_mock_enformion_results(search_params)
+    if not enformion_client:
+        return """
+❌ **Search Service Not Available**
+
+The person search service requires API credentials to be configured. 
+
+**For Development/Testing:**
+- Configure EnformionGo API credentials
+- Set ENFORMION_AP_NAME and ENFORMION_AP_PASSWORD environment variables
+
+**Alternative Data Sources:**
+- Use public directory sites directly
+- Try social media searches
+- Contact information may be available through other services
+
+Would you like me to provide links to free public directory sites instead?
+"""
+    
+    try:
+        # Make real API call
+        response = await enformion_client.search_person(search_params)
+        await enformion_client.close()
+        
+        if not response.success:
+            return f"""
+❌ **Search Failed**
+
+Error: {response.error_message or 'Unknown error occurred'}
+
+**What you can try:**
+- Check the spelling of the name
+- Try with just first and last name
+- Use a different location (city, state)
+- Contact our support if the problem persists
+
+**Alternative:**
+You can search public directories directly:
+- FastPeopleSearch.com
+- TruePeopleSearch.com  
+- USPhoneBook.com
+"""
+        
+        if not response.results:
+            return """
+❌ **No Results Found**
+
+No matches were found for your search criteria.
+
+**Try refining your search:**
+- Check the spelling of the name
+- Try variations of the name (nicknames, maiden names)
+- Use a broader location (just state instead of city)
+- Try different age ranges
+- Consider if they might have moved to a different area
+
+**Free public directory alternatives:**
+- FastPeopleSearch.com
+- TruePeopleSearch.com
+- USPhoneBook.com
+"""
+        
+        # Convert real results to our format
+        search_context = {
+            "relationship": ctx.relationship,
+            "additional_context": ctx.additional_context, 
+            "first_name": ctx.first_name
+        }
         search_results = [
-            enformion_to_search_result(result) 
+            enformion_to_search_result(result, search_context) 
             for result in response.results
         ]
         ctx.last_query_id = response.query_id
-    
-    ctx.results = search_results
-    ctx.search_performed = True
-    
-    # Format results for user - FREE TIER (AI Preview)
-    if not search_results:
-        return "No matches found. Would you like to try adjusting the search criteria?"
-    
-    results_summary = f"Found {len(search_results)} potential matches:\n\n"
-    
-    for i, result in enumerate(search_results, 1):
-        results_summary += f"#{i} - {result['confidence']}% Match Confidence\n"
-        results_summary += f"   {result['first_name']} {result['last_name']}\n"
+        ctx.results = search_results
+        ctx.search_performed = True
         
-        # FREE TIER: Only show city/state, no specific addresses
-        if result['city'] and result['state']:
-            results_summary += f"   📍 {result['city']}, {result['state']}\n"
-        elif result['state']:
-            results_summary += f"   📍 {result['state']}\n"
+        # Format results for user - FREE TIER (AI Preview)
+        results_summary = f"Found {len(search_results)} potential matches:\n\n"
         
-        # Show age range instead of exact age for free tier
-        age = result.get('age', 0)
-        if age > 0:
-            age_range_start = (age // 5) * 5  # Round down to nearest 5
-            age_range_end = age_range_start + 4
-            results_summary += f"   👤 Age range: {age_range_start}-{age_range_end}\n"
+        for i, result in enumerate(search_results, 1):
+            results_summary += f"#{i} - {result['confidence']}% Match Confidence\n"
+            results_summary += f"   {result['first_name']} {result['last_name']}\n"
+            
+            # Show location
+            if result['city'] and result['state']:
+                results_summary += f"   📍 {result['city']}, {result['state']}\n"
+            elif result['state']:
+                results_summary += f"   📍 {result['state']}\n"
+            
+            # Show age range for privacy
+            age = result.get('age', 0)
+            if age > 0:
+                age_range_start = (age // 5) * 5
+                age_range_end = age_range_start + 4
+                results_summary += f"   👤 Age range: {age_range_start}-{age_range_end}\n"
+            
+            # Timeline analysis
+            results_summary += f"   🤖 AI Analysis: {result['timeline_match']}\n"
+            
+            # Professional background (only if real data exists)
+            if result.get('professional_background'):
+                results_summary += f"   💼 {result['professional_background']}\n"
+            
+            # Verification count
+            verification_count = 0
+            if result.get('phone_numbers'):
+                verification_count += len(result['phone_numbers'])
+            if result.get('previous_addresses'):
+                verification_count += len(result['previous_addresses'])
+            if result.get('relatives'):
+                verification_count += len(result['relatives'])
+            
+            if verification_count > 0:
+                results_summary += f"   ✓ Verified across {verification_count} data points\n"
+            
+            results_summary += "\n"
         
-        # AI Analysis (this is the value-add for free tier)
-        results_summary += f"   🤖 AI Analysis: {result['timeline_match']}\n"
+        # Add monetization
+        results_summary += "💳 **Get Full Contact Information**\n"
+        results_summary += "For complete details including phone numbers, email addresses, and full address history:\n\n"
+        results_summary += "🔹 **Lite Report ($5)** - Full contact info, address history, known relatives\n"
+        results_summary += "🔹 **Premium Membership ($19.95/month)** - Unlimited searches, background data, monitoring\n\n"
+        results_summary += "Type 'purchase lite report for result #X' or 'upgrade to premium' to get full access.\n\n"
         
-        # Show professional background if available
-        if result['professional_background']:
-            results_summary += f"   💼 {result['professional_background']}\n"
+        # Add free directory links
+        from free_directory_scraper import generate_free_directory_links
+        free_links = generate_free_directory_links(ctx.first_name, ctx.last_name, ctx.current_state)
         
-        # Show verification indicators without revealing details
-        verification_count = 0
-        if result.get('phone_numbers'):
-            verification_count += len(result['phone_numbers'])
-        if result.get('previous_addresses'):
-            verification_count += len(result['previous_addresses'])
-        if result.get('relatives'):
-            verification_count += len(result['relatives'])
+        results_summary += "📂 **Results also found on top public record directory sites:**\n\n"
+        for link in free_links:
+            results_summary += f"🔗 **{link['site_name']}** | {link['description']}\n"
+            results_summary += f"{link['snippet']}\n"
+            results_summary += f"→ View Profile: {link['url']}\n\n"
         
-        if verification_count > 0:
-            results_summary += f"   ✓ Verified across {verification_count} data points\n"
+        results_summary += "Or ask me to refine the search if these aren't the right matches."
         
-        results_summary += "\n"
-    
-    # Add monetization hooks + free directory links
-    results_summary += "💳 **Get Full Contact Information**\n"
-    results_summary += "For complete details including phone numbers, email addresses, and full address history:\n\n"
-    results_summary += "🔹 **Lite Report ($5)** - Full contact info, address history, known relatives\n"
-    results_summary += "🔹 **Premium Membership ($19.95/month)** - Unlimited searches, background data, monitoring\n\n"
-    results_summary += "Type 'purchase lite report for result #X' or 'upgrade to premium' to get full access.\n\n"
-    
-    # Add free directory site links
-    from free_directory_scraper import generate_free_directory_links
-    free_links = generate_free_directory_links(ctx.first_name, ctx.last_name, ctx.current_state)
-    
-    results_summary += "📂 **Results also found on top public record directory sites:**\n\n"
-    for link in free_links:
-        results_summary += f"🔗 **{link['site_name']}** | {link['description']}\n"
-        results_summary += f"{link['snippet']}\n"
-        results_summary += f"→ View Profile: {link['url']}\n\n"
-    
-    results_summary += "Or ask me to refine the search if these aren't the right matches."
-    
-    return results_summary
+        return results_summary
+        
+    except Exception as e:
+        return f"""
+❌ **Search Service Error**
+
+An unexpected error occurred: {str(e)}
+
+**What you can try:**
+- Try your search again in a few minutes
+- Simplify your search criteria
+- Contact support if the problem persists
+
+**Alternative:**
+You can search public directories directly while we resolve this:
+- FastPeopleSearch.com
+- TruePeopleSearch.com
+- USPhoneBook.com
+"""
 
 @function_tool(
     name_override="refine_search",
@@ -556,82 +605,45 @@ async def safety_guardrail(
 # AGENTS
 # =========================
 
-def person_search_instructions(
-    run_context: RunContextWrapper[PersonSearchContext], agent: Agent[PersonSearchContext]
-) -> str:
-    ctx = run_context.context
-    
-    return f"""
+# FIXED: Make instructions more explicit about ALWAYS calling update_search_criteria
+person_search_instructions = f"""
 {RECOMMENDED_PROMPT_PREFIX}
 
-You are an AI assistant that helps people find others through conversational person search powered by EnformionGo. 
+You are an AI assistant that helps people find others through conversational person search powered by EnformionGo.
 
-CURRENT SEARCH STATE:
-- Name: {ctx.first_name or '[not set]'} {ctx.last_name or '[not set]'}
-- Age: {ctx.age or ctx.age_range or '[not set]'}
-- Location: {ctx.current_city or ''} {ctx.current_state or ''} {'[not set]' if not ctx.current_city and not ctx.current_state else ''}
-- Relationship: {ctx.relationship or '[not set]'}
-- Ready to search: {ctx.search_ready}
-- Search performed: {ctx.search_performed}
+CRITICAL RULE #1: ALWAYS CALL update_search_criteria IMMEDIATELY
+- The INSTANT you see ANY name in user input, call update_search_criteria
+- "I'm looking for Sarah Johnson" → IMMEDIATELY call update_search_criteria(first_name="Sarah", last_name="Johnson")
+- "Find John" → IMMEDIATELY call update_search_criteria(first_name="John")
+- "Sarah from college" → IMMEDIATELY call update_search_criteria(first_name="Sarah", relationship="college friend")
+- NO EXCEPTIONS - ALWAYS extract and store information first, then respond
 
-YOUR ROLE:
-1. **ALWAYS Use Tools IMMEDIATELY - THIS IS CRITICAL**: 
-   - The MOMENT you extract ANY information (names, ages, locations, relationships), you MUST call update_search_criteria
-   - If user says "Sarah from college in 2010" → IMMEDIATELY call update_search_criteria with first_name="Sarah", relationship="college roommate", additional_context="2010"
-   - If user says "Jennifer Diaz graduated 1993" → IMMEDIATELY call update_search_criteria with first_name="Jennifer", last_name="Diaz", age_range=(48,49), additional_context="graduated 1993"
-   - NEVER respond without first storing the information
+CRITICAL RULE #2: Extract ALL available information in one call
+- Don't make multiple calls - extract everything you can in the first update_search_criteria call
+- If user says "I'm looking for my college roommate Sarah Johnson who graduated in 2015", call:
+  update_search_criteria(first_name="Sarah", last_name="Johnson", relationship="college roommate", additional_context="graduated in 2015")
 
-2. **Be Intelligent About Age**: 
-   - If someone graduated high school in a specific year, calculate their approximate current age
-   - High school graduation typically happens at age 17-18
-   - Example: Graduated 1993 → Born ~1975 → Current age ~49
+CRITICAL RULE #3: Then ask follow-up questions
+- AFTER calling update_search_criteria, ask ONE clarifying question
+- Focus on getting specific location (city + state) since that's required for search
 
-3. **Ask Smart Follow-up Questions ONE AT A TIME**:
-   - After getting name: Ask for age OR graduation year OR when they knew them
-   - After getting timeframe: Ask for location (school, workplace, city/state)
-   - After getting basic info: Ask for current location or additional details
-   - Don't ask for information already provided
+EXAMPLE FLOW:
+User: "I'm looking for Sarah Johnson"
+1. IMMEDIATELY call: update_search_criteria(first_name="Sarah", last_name="Johnson")
+2. THEN respond: "I'll help you find Sarah Johnson! To get the best results, could you tell me where you knew her from? What city or state?"
 
-4. **Show Understanding**: 
-   - Summarize what you know: "So you're looking for Jennifer Diaz, your high school classmate from 1993..."
-   - Connect the dots: "That means she's probably around 49 years old now"
+Your job is to:
+1. ALWAYS call update_search_criteria first when names are mentioned
+2. Ask smart follow-up questions to get location info
+3. Search when you have name + specific location
+4. Help with purchase options after showing results
 
-5. **Minimum Search Criteria - ABSOLUTELY REQUIRED**: 
-   - NEVER search without: First name + Last name + SPECIFIC LOCATION (city + state)
-   - Age alone is NOT sufficient for searching
-   - Examples of what you NEED before searching:
-     * "Jennifer Diaz from Quartz Hill, CA" ✅
-     * "Sarah from UCLA in Los Angeles, CA" ✅  
-     * "Jennifer Diaz, age 48" ❌ (no location)
-     * "Sarah from college" ❌ (no specific location)
-   
-6. **REQUIRED Follow-up Questions (ASK BEFORE SEARCHING)**:
-   - If user mentions "high school": Ask "What high school and what city/state was it in?"
-   - If user mentions "college": Ask "What college and in what city?"
-   - If user mentions "work": Ask "What company and in what city?"
-   - If user gives only a name + age: Ask "Where did you know them from? What city or state?"
-   - DO NOT search until you have specific location information
+TOOLS:
+- update_search_criteria: Store info immediately (USE FIRST, ALWAYS)
+- search_person: Search when ready (name + location required)
+- refine_search, purchase_lite_report, upgrade_to_premium
 
-CRITICAL RULES:
-- IMMEDIATELY use update_search_criteria when user provides names, ages, locations, or relationships
-- Ask ONE question at a time
-- Calculate ages from graduation years or other timeframes
-- Show you understand the context: "your college roommate", "high school classmate", etc.
-- If context shows previous conversation, acknowledge and build on it
-
-TOOLS AVAILABLE:
-- update_search_criteria: Store information as you collect it (USE IMMEDIATELY when info is provided)
-- search_person: Execute the search when ready (shows AI preview - free tier)
-- refine_search: Adjust criteria based on results
-- purchase_lite_report: Generate $5 lite report with full contact info
-- upgrade_to_premium: Show premium membership benefits
-
-MONETIZATION STRATEGY:
-- FREE TIER: AI analysis + general location + age ranges (no PII)
-- LITE REPORT ($5): Full contact info, address history, relatives
-- PREMIUM ($19.95/month): Unlimited searches + background data + monitoring
-
-Remember: Be conversational, intelligent, and helpful. Extract information automatically and ask smart follow-up questions.
+Remember: Extract first, ask questions second, search when ready!
 """
 
 person_search_agent = Agent[PersonSearchContext](
@@ -641,78 +653,3 @@ person_search_agent = Agent[PersonSearchContext](
     tools=[update_search_criteria, search_person, refine_search, purchase_lite_report, upgrade_to_premium],
     input_guardrails=[relevance_guardrail, safety_guardrail],
 )
-
-# =========================
-# FASTAPI SERVER
-# =========================
-
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-app = FastAPI(title="AI Person Search Engine", version="1.0.0")
-
-@app.post("/chat")
-async def chat_endpoint(req: Request):
-    try:
-        body = await req.json()
-        message = body.get("message", "")
-        conversation_id = body.get("conversation_id", "")
-
-        # Run the person search agent with the user message
-        result = await Runner.run(
-            person_search_agent,
-            input=[{"role": "user", "content": message}],
-            context=create_initial_context()
-        )
-
-        # Extract data using the correct attributes
-        agent_name = result.last_agent.name if result.last_agent else person_search_agent.name
-        context = result.context_wrapper.context if result.context_wrapper else create_initial_context()
-        
-        # Get final output as message
-        messages = []
-        if result.final_output:
-            messages.append({
-                "content": str(result.final_output),
-                "agent": agent_name
-            })
-        
-        # Convert context to dict
-        context_dict = context.model_dump() if hasattr(context, 'model_dump') else context.dict()
-
-        return JSONResponse({
-            "conversation_id": conversation_id or "new_conversation",
-            "current_agent": agent_name,
-            "messages": messages,
-            "events": [],  # We'll add event processing later if needed
-            "context": context_dict
-        })
-
-    except Exception as e:
-        import traceback
-        return JSONResponse(status_code=500, content={
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        })
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "AI Person Search Engine"}
-
-@app.get("/")
-async def root():
-    """Root endpoint with service information."""
-    return {
-        "service": "AI Person Search Engine",
-        "version": "1.0.0",
-        "description": "Conversational AI-powered person search using EnformionGo API",
-        "endpoints": {
-            "chat": "POST /chat - Main conversation endpoint",
-            "health": "GET /health - Health check"
-        }
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)

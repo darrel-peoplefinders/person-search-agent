@@ -473,6 +473,161 @@ async def debug_imports():
 # Ensure app is available for uvicorn
 print("✓ FastAPI app created and configured")
 
+@app.post("/debug/enformion")
+async def debug_enformion_raw(request: dict):
+    """
+    Debug endpoint to get raw EnformionGo API response
+    
+    Request body:
+    {
+        "first_name": "Jennifer",
+        "last_name": "Diaz", 
+        "city": "Lancaster",
+        "state": "California"
+    }
+    """
+    try:
+        from enformion_api import create_enformion_client, PersonSearchParams
+        
+        # Extract search parameters
+        first_name = request.get("first_name", "")
+        last_name = request.get("last_name", "")
+        city = request.get("city")
+        state = request.get("state")
+        age = request.get("age")
+        
+        if not first_name or not last_name:
+            return {"error": "first_name and last_name are required"}
+        
+        # Create search parameters
+        search_params = PersonSearchParams(
+            first_name=first_name,
+            last_name=last_name,
+            city=city,
+            state=state,
+            age=age
+        )
+        
+        # Try EnformionGo API
+        enformion_client = create_enformion_client()
+        
+        if not enformion_client:
+            return {
+                "error": "EnformionGo client not configured",
+                "message": "Missing ENFORMION_AP_NAME or ENFORMION_AP_PASSWORD environment variables",
+                "using_mock": True,
+                "mock_data": "Would return mock data here"
+            }
+        
+        # Make raw API call and capture response
+        import httpx
+        from datetime import datetime
+        
+        # Build the exact same request that would be sent to EnformionGo
+        payload = {
+            "FirstName": search_params.first_name,
+            "LastName": search_params.last_name,
+            "Page": 1,
+            "ResultsPerPage": 2,
+            "Includes": [
+                "Addresses", 
+                "PhoneNumbers", 
+                "EmailAddresses", 
+                "DatesOfBirth",
+                "RelativesSummary",
+                "AssociatesSummary"
+            ]
+        }
+        
+        # Add optional parameters
+        if search_params.city or search_params.state:
+            addresses = []
+            address_line2_parts = []
+            
+            if search_params.city:
+                address_line2_parts.append(search_params.city)
+            if search_params.state:
+                address_line2_parts.append(search_params.state)
+                
+            if address_line2_parts:
+                addresses.append({
+                    "AddressLine2": ", ".join(address_line2_parts)
+                })
+                payload["Addresses"] = addresses
+        
+        if search_params.age:
+            payload["Age"] = search_params.age
+        
+        # Make the actual API call
+        try:
+            async with httpx.AsyncClient(
+                timeout=30,
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "galaxy-ap-name": enformion_client.config.ap_name,
+                    "galaxy-ap-password": enformion_client.config.ap_password,
+                    "galaxy-search-type": enformion_client.config.search_type,
+                    "galaxy-client-type": enformion_client.config.client_type,
+                    "galaxy-client-session-id": f"debug_session_{int(datetime.now().timestamp())}"
+                }
+            ) as client:
+                
+                response = await client.post(
+                    f"{enformion_client.config.base_url}/PersonSearch",
+                    json=payload
+                )
+                
+                return {
+                    "request_payload": payload,
+                    "response_status": response.status_code,
+                    "response_headers": dict(response.headers),
+                    "raw_response": response.text,
+                    "parsed_json": response.json() if response.status_code == 200 else None,
+                    "config": {
+                        "base_url": enformion_client.config.base_url,
+                        "search_type": enformion_client.config.search_type,
+                        "ap_name": enformion_client.config.ap_name,
+                        "ap_password": "***" # Don't expose password
+                    }
+                }
+                
+        except httpx.TimeoutException:
+            return {"error": "Request timeout", "message": "EnformionGo API did not respond in time"}
+        except Exception as e:
+            return {"error": "API call failed", "message": str(e)}
+        
+    except Exception as e:
+        import traceback
+        return {
+            "error": "Debug endpoint failed", 
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+@app.get("/debug/enformion/config")
+async def debug_enformion_config():
+    """Check EnformionGo configuration"""
+    import os
+    from enformion_api import create_enformion_client
+    
+    client = create_enformion_client()
+    
+    return {
+        "configured": client is not None,
+        "environment_variables": {
+            "ENFORMION_AP_NAME": "SET" if os.getenv("ENFORMION_AP_NAME") else "MISSING",
+            "ENFORMION_AP_PASSWORD": "SET" if os.getenv("ENFORMION_AP_PASSWORD") else "MISSING",
+            "ENFORMION_BASE_URL": os.getenv("ENFORMION_BASE_URL", "DEFAULT"),
+            "ENFORMION_SEARCH_TYPE": os.getenv("ENFORMION_SEARCH_TYPE", "DEFAULT")
+        },
+        "config": {
+            "base_url": client.config.base_url if client else None,
+            "search_type": client.config.search_type if client else None,
+            "max_results": client.config.max_results if client else None
+        } if client else None
+    }
+
 if __name__ == "__main__":
     import uvicorn
     print("Starting server...")
