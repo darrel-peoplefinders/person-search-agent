@@ -110,12 +110,15 @@ async def update_search_criteria(
         else:
             ctx.additional_context = additional_context.strip()
     
-    # Check if we have minimum criteria for search
+    # Check if we have minimum criteria for search - STRICTER REQUIREMENTS
     has_name = ctx.first_name and ctx.last_name
-    has_location = ctx.current_city or ctx.current_state
-    has_age_info = ctx.age or ctx.age_range
+    has_specific_location = (
+        (ctx.current_city and ctx.current_state) or  # Current city + state
+        (ctx.previous_locations and any("," in loc for loc in ctx.previous_locations))  # Previous location with city/state
+    )
     
-    ctx.search_ready = has_name and (has_location or has_age_info)
+    # REQUIRE both name AND specific location - don't search with just age
+    ctx.search_ready = has_name and has_specific_location
     
     summary = f"Updated search criteria: {ctx.first_name or ''} {ctx.last_name or ''}".strip()
     if ctx.current_city and ctx.current_state:
@@ -170,9 +173,14 @@ async def search_person(
             await enformion_client.close()
             
             if response.success:
-                # Convert EnformionGo results to our format
+                # Convert EnformionGo results to our format with search context for story-telling
+                search_context = {
+                    "relationship": ctx.relationship,
+                    "additional_context": ctx.additional_context, 
+                    "first_name": ctx.first_name
+                }
                 search_results = [
-                    enformion_to_search_result(result) 
+                    enformion_to_search_result(result, search_context) 
                     for result in response.results
                 ]
                 ctx.last_query_id = response.query_id
@@ -243,12 +251,23 @@ async def search_person(
         
         results_summary += "\n"
     
-    # Add monetization hooks
+    # Add monetization hooks + free directory links
     results_summary += "💳 **Get Full Contact Information**\n"
     results_summary += "For complete details including phone numbers, email addresses, and full address history:\n\n"
     results_summary += "🔹 **Lite Report ($5)** - Full contact info, address history, known relatives\n"
     results_summary += "🔹 **Premium Membership ($19.95/month)** - Unlimited searches, background data, monitoring\n\n"
     results_summary += "Type 'purchase lite report for result #X' or 'upgrade to premium' to get full access.\n\n"
+    
+    # Add free directory site links
+    from free_directory_scraper import generate_free_directory_links
+    free_links = generate_free_directory_links(ctx.first_name, ctx.last_name, ctx.current_state)
+    
+    results_summary += "📂 **Results also found on top public record directory sites:**\n\n"
+    for link in free_links:
+        results_summary += f"🔗 **{link['site_name']}** | {link['description']}\n"
+        results_summary += f"{link['snippet']}\n"
+        results_summary += f"→ View Profile: {link['url']}\n\n"
+    
     results_summary += "Or ask me to refine the search if these aren't the right matches."
     
     return results_summary
@@ -400,9 +419,9 @@ async def upgrade_to_premium(
     """Show premium membership upgrade information."""
     
     premium_info = """
-💎 **Premium Membership - $19.95/month**
+💎 **Premium Membership - $19.95/month at PeopleFinders.com**
 
-✅ **Everything in Lite Reports PLUS:**
+✅ **Get Full Access to PeopleFinders Premium:**
 • Unlimited person searches
 • Complete background reports
 • Criminal records & court documents
@@ -436,7 +455,7 @@ async def upgrade_to_premium(
 • Export reports to PDF
 • API access for businesses
 
-To upgrade, visit: [Payment Portal] or type 'start premium trial' for a 7-day free trial.
+Visit PeopleFinders.com to upgrade to Premium Membership for $19.95/month.
 
 Want to see a sample premium report for your current search results?
 """
@@ -457,9 +476,24 @@ guardrail_agent = Agent(
     name="Relevance Guardrail",
     instructions=(
         "Determine if the user's message is related to finding or searching for people. "
-        "This includes questions about locating friends, family, colleagues, classmates, or any person. "
-        "It is OK for the user to send conversational messages like 'Hi', 'OK', 'Thanks' etc. "
-        "Return is_relevant=True if the message is conversational or person-search related, else False."
+        "This includes both DIRECT search requests AND follow-up context that helps with person searches. "
+        "\n"
+        "ALLOW (is_relevant=True) messages about: "
+        "- Direct person search requests ('looking for', 'find my friend') "
+        "- Follow-up context that adds search details: "
+        "  * School names and locations ('We went to UCLA in Los Angeles') "
+        "  * Cities, states, years ('She lived in Colorado', 'graduated in 2010') "
+        "  * Jobs, companies, relationships ('worked at Microsoft', 'my roommate') "
+        "  * Ages, descriptions, clarifications ('she was about 25', 'blonde hair') "
+        "  * Replies to previous questions about person search details "
+        "- Conversational messages ('Hi', 'OK', 'Thanks', 'Yes', 'No') "
+        "\n"
+        "BLOCK (is_relevant=False) only if clearly changing topics: "
+        "- Weather, news, sports unrelated to person search "
+        "- Technical questions about the system itself "
+        "- Completely unrelated conversations "
+        "\n"
+        "When in doubt, allow it - better to be permissive for person search context."
     ),
     output_type=RelevanceOutput,
 )
@@ -562,19 +596,21 @@ YOUR ROLE:
    - Summarize what you know: "So you're looking for Jennifer Diaz, your high school classmate from 1993..."
    - Connect the dots: "That means she's probably around 49 years old now"
 
-5. **Minimum Search Criteria - BE MORE THOROUGH**: 
-   - For high school/college classmates: ALWAYS ask for school name AND location
-   - For work colleagues: ALWAYS ask for company name AND location  
-   - For neighbors: ALWAYS ask for neighborhood/street AND city
-   - Need: First name + Last name + Age/Age Range + SPECIFIC LOCATION
-   - Don't search with just name + age - always gather contextual location info first
-
-6. **Smart Follow-up Questions (REQUIRED BEFORE SEARCH)**:
-   - If user mentions "high school": Ask "What high school and what city/state?"
-   - If user mentions "college": Ask "What college and where was it located?"
+5. **Minimum Search Criteria - ABSOLUTELY REQUIRED**: 
+   - NEVER search without: First name + Last name + SPECIFIC LOCATION (city + state)
+   - Age alone is NOT sufficient for searching
+   - Examples of what you NEED before searching:
+     * "Jennifer Diaz from Quartz Hill, CA" ✅
+     * "Sarah from UCLA in Los Angeles, CA" ✅  
+     * "Jennifer Diaz, age 48" ❌ (no location)
+     * "Sarah from college" ❌ (no specific location)
+   
+6. **REQUIRED Follow-up Questions (ASK BEFORE SEARCHING)**:
+   - If user mentions "high school": Ask "What high school and what city/state was it in?"
+   - If user mentions "college": Ask "What college and in what city?"
    - If user mentions "work": Ask "What company and in what city?"
-   - If user gives graduation year: Calculate age AND ask for location details
-   - Only search when you have BOTH personal info AND specific location context
+   - If user gives only a name + age: Ask "Where did you know them from? What city or state?"
+   - DO NOT search until you have specific location information
 
 CRITICAL RULES:
 - IMMEDIATELY use update_search_criteria when user provides names, ages, locations, or relationships

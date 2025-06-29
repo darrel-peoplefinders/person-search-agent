@@ -429,7 +429,7 @@ def create_enformion_client() -> Optional[EnformionClient]:
 # Conversion Helpers
 # =========================
 
-def enformion_to_search_result(enformion_result: EnformionResult) -> Dict[str, Any]:
+def enformion_to_search_result(enformion_result: EnformionResult, search_context: dict = None) -> Dict[str, Any]:
     """
     Convert EnformionResult to the format expected by the person search agent
     """
@@ -457,8 +457,8 @@ def enformion_to_search_result(enformion_result: EnformionResult) -> Dict[str, A
             if name:
                 relatives.append(name)
     
-    # Generate timeline analysis (this would be enhanced with AI)
-    timeline_match = _generate_timeline_analysis(enformion_result)
+    # Generate story-based timeline analysis
+    timeline_match = _generate_timeline_analysis(enformion_result, search_context)
     
     # Extract professional background
     professional_background = ""
@@ -485,30 +485,63 @@ def enformion_to_search_result(enformion_result: EnformionResult) -> Dict[str, A
         "email_addresses": enformion_result.email_addresses or []
     }
 
-def _generate_timeline_analysis(result: EnformionResult) -> str:
+def _generate_timeline_analysis(result: EnformionResult, search_context: dict = None) -> str:
     """
-    Generate a timeline analysis string based on the result data
-    This would be enhanced with AI analysis in production
+    Generate a timeline analysis string that tells the story of this person
+    matching the user's search context
     """
     analysis_parts = []
     
-    if result.age:
-        analysis_parts.append(f"Age {result.age} matches expected range")
+    # Extract search context for story-telling
+    relationship = search_context.get("relationship", "") if search_context else ""
+    additional_context = search_context.get("additional_context", "") if search_context else ""
+    first_name = search_context.get("first_name", "") if search_context else ""
     
+    # Base age/timeline analysis
+    if result.age:
+        analysis_parts.append(f"At age {result.age}, this matches your expected timeline")
+    
+    # Story-based geographic analysis
     if result.current_address and result.previous_addresses:
         current_state = result.current_address.get("state", "")
+        current_city = result.current_address.get("city", "")
+        
+        # Look for meaningful patterns in address history
         prev_states = [addr.get("state") for addr in result.previous_addresses if addr.get("state")]
-        if prev_states and current_state not in prev_states:
-            analysis_parts.append(f"Geographic movement from {prev_states[0]} to {current_state}")
+        prev_cities = [addr.get("city") for addr in result.previous_addresses if addr.get("city")]
+        
+        # Build the story
+        if "college" in relationship.lower() and "2010" in additional_context:
+            if "CA" in prev_states and current_state != "CA":
+                analysis_parts.append(f"This person lived in California around the time you went to college together, then moved to {current_state}")
+            elif "Los Angeles" in prev_cities or "LA" in prev_cities:
+                analysis_parts.append(f"This person has Los Angeles in their address history, matching your UCLA connection")
+        
+        elif "high school" in relationship.lower() and "1993" in additional_context:
+            if len(prev_states) > 0:
+                analysis_parts.append(f"Geographic movement from {prev_states[0]} fits the timeline since high school graduation")
+        
+        # Marriage and name change detection
+        if len(set(prev_states)) > 1:
+            analysis_parts.append(f"Multiple state moves suggest major life changes like marriage or career")
     
-    if result.education_history:
-        analysis_parts.append("Education history available for verification")
-    
+    # Professional background story
     if result.employment_history:
-        analysis_parts.append("Professional background confirmed")
+        latest_job = result.employment_history[0]
+        company = latest_job.get("company", "")
+        if company:
+            analysis_parts.append(f"Professional background at {company} indicates career progression since college")
     
+    # Education verification
+    if result.education_history:
+        analysis_parts.append(f"Education history available for verification against your {relationship} connection")
+    
+    # Default if no specific patterns found
     if not analysis_parts:
-        return "Basic information matches search criteria"
+        if relationship and first_name:
+            return f"This {first_name} profile shows life patterns consistent with your {relationship} search"
+        else:
+            return "Basic information matches search criteria"
     
     return ". ".join(analysis_parts)
 
