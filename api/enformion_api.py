@@ -81,23 +81,29 @@ class EnformionClient:
             }
         )
     
-    async def search_person(self, params: PersonSearchParams) -> EnformionResponse:
+    async def search_person(self, params: PersonSearchParams, page: int = 1, results_per_page: Optional[int] = None) -> EnformionResponse:
         """
-        Search for a person using EnformionGo API
+        Search for a person using EnformionGo API with pagination support
         
         Args:
             params: Search parameters
+            page: Page number (default 1)
+            results_per_page: Number of results per page (default from config)
             
         Returns:
             EnformionResponse with search results
         """
         try:
+            # Use provided results_per_page or fall back to config
+            if results_per_page is None:
+                results_per_page = self.config.max_results
+            
             # Build EnformionGo API request payload
             payload = {
                 "FirstName": params.first_name,
                 "LastName": params.last_name,
-                "Page": 1,
-                "ResultsPerPage": self.config.max_results,
+                "Page": page,                           # Use provided page
+                "ResultsPerPage": results_per_page,     # Use provided limit
                 "Includes": [
                     "Addresses", 
                     "PhoneNumbers", 
@@ -108,7 +114,7 @@ class EnformionClient:
                 ]
             }
             
-            # Add optional parameters
+            # Add optional parameters (rest of your existing code stays the same)
             if params.middle_name:
                 payload["MiddleName"] = params.middle_name
             if params.age:
@@ -135,23 +141,17 @@ class EnformionClient:
                     })
                     payload["Addresses"] = addresses
             
-            # Make API request to EnformionGo
+            # Make API request to EnformionGo (rest of your existing code)
             response = await self.client.post(
                 f"{self.config.base_url}/PersonSearch",
                 json=payload
             )
             
             print(f"EnformionGo Response Status: {response.status_code}")
-            print(f"EnformionGo Response Headers: {response.headers}")
+            print(f"EnformionGo Payload Sent: {payload}")  # Debug logging
             
             if response.status_code == 200:
                 data = response.json()
-                print(f"EnformionGo Response Data Type: {type(data)}")
-                print(f"EnformionGo Response Length: {len(data) if isinstance(data, list) else 'Not a list'}")
-                if isinstance(data, list) and len(data) > 0:
-                    print(f"First Record Keys: {list(data[0].keys()) if isinstance(data[0], dict) else 'Not a dict'}")
-                elif isinstance(data, dict):
-                    print(f"Response Dict Keys: {list(data.keys())}")
                 return self._parse_enformion_response(data)
             else:
                 return EnformionResponse(
@@ -163,15 +163,6 @@ class EnformionClient:
                     error_message=f"EnformionGo API request failed: {response.status_code} - {response.text}"
                 )
                 
-        except httpx.TimeoutException:
-            return EnformionResponse(
-                success=False,
-                total_results=0,
-                results=[],
-                query_id="",
-                credits_used=0,
-                error_message="Request timeout - EnformionGo API did not respond in time"
-            )
         except Exception as e:
             return EnformionResponse(
                 success=False,
@@ -491,57 +482,8 @@ def enformion_to_search_result(enformion_result: EnformionResult, search_context
     }
 
 def _generate_timeline_analysis(result: EnformionResult, search_context: dict = None) -> str:
-    """
-    Generate accurate timeline analysis based on graduation year and search context
-    """
-    if not search_context:
-        return f"Age {result.age} - no additional timeline context available"
+    """Just return raw timeline data - let AI do the analysis"""
+    if not search_context or not search_context.get("additional_context"):
+        return f"Age {result.age}, no additional timeline context provided"
     
-    additional_context = search_context.get("additional_context", "")
-    relationship = search_context.get("relationship", "")
-    
-    # Extract graduation year from context
-    import re
-    grad_match = re.search(r'graduated.*?(\d{4})', additional_context)
-    
-    if grad_match:
-        graduation_year = int(grad_match.group(1))
-        current_year = 2025
-        
-        # Determine graduation type and expected age
-        if "high school" in additional_context.lower():
-            # High school graduation typically at age 17-18
-            expected_age = current_year - graduation_year + 18
-            graduation_type = "high school"
-        elif "college" in additional_context.lower():
-            # College graduation typically at age 21-22
-            expected_age = current_year - graduation_year + 22
-            graduation_type = "college"
-        else:
-            # Default to college if not specified
-            expected_age = current_year - graduation_year + 22
-            graduation_type = "graduation"
-        
-        age_difference = abs(result.age - expected_age)
-        
-        # Generate accurate analysis
-        if age_difference <= 2:
-            return f"At age {result.age}, this perfectly matches your expected timeline. Someone who graduated {graduation_type} in {graduation_year} would be around {expected_age} now."
-        elif result.age < expected_age - 2:
-            years_too_young = expected_age - result.age
-            return f"At age {result.age}, this person is likely too young. Someone who graduated {graduation_type} in {graduation_year} would be around {expected_age} now - this is {years_too_young} years younger than expected. NOT A LIKELY MATCH."
-        else:
-            years_too_old = result.age - expected_age
-            return f"At age {result.age}, this person is older than expected. Someone who graduated {graduation_type} in {graduation_year} would be around {expected_age} now - this is {years_too_old} years older than expected. Possible but less likely match."
-    
-    # Handle other relationship contexts without graduation year
-    if "college" in relationship.lower():
-        if result.age < 25:
-            return f"At age {result.age}, this person is likely too young to be a college friend."
-        elif result.age > 65:
-            return f"At age {result.age}, this person might be older than expected for a college connection."
-        else:
-            return f"At age {result.age}, this could match your college timeline."
-    
-    # Default analysis
-    return f"Age {result.age} - timeline analysis needs more graduation year context"
+    return f"Age {result.age}, user context: {search_context.get('additional_context')}"

@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv() 
+
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -5,6 +8,29 @@ from typing import Optional, List, Dict, Any
 from uuid import uuid4
 import time
 import logging
+import os
+
+def check_environment():
+    """Check critical environment variables"""
+    required_vars = [
+        "OPENAI_API_KEY",
+        "ENFORMION_AP_NAME", 
+        "ENFORMION_AP_PASSWORD"
+    ]
+    
+    missing_vars = []
+    for var in required_vars:
+        if not os.getenv(var):
+            missing_vars.append(var)
+    
+    if missing_vars:
+        print(f"⚠️ Missing environment variables: {missing_vars}")
+        print("⚠️ Some features may not work properly")
+    else:
+        print("✅ All required environment variables are set")
+
+# Call this at startup
+check_environment()
 
 # Add error handling for imports
 try:
@@ -302,18 +328,21 @@ async def chat_endpoint(req: ChatRequest):
         # Build input items for this turn
         input_items = state["input_items"] + [{"content": req.message, "role": "user"}]
         
-        old_context = state["context"].model_dump().copy() if hasattr(state["context"], 'model_dump') else {}
         guardrail_checks: List[GuardrailCheck] = []
 
         try:
-            # Run agent with conversation history and context
+            # IMPORTANT: Ensure Runner.run is called with proper async context
             result = await Runner.run(
                 current_agent, 
                 input_items, 
                 context=state["context"]
             )
         except Exception as e:
-            if "InputGuardrailTripwireTriggered" in str(type(e)):
+            error_type = str(type(e).__name__)
+            logger.error(f"Error running agent ({error_type}): {e}")
+            
+            # Handle different types of errors
+            if "InputGuardrailTripwireTriggered" in error_type:
                 # Handle guardrail violations
                 refusal = "I can only help with legitimate person search requests. Please ensure your search intent is appropriate."
                 
@@ -331,9 +360,11 @@ async def chat_endpoint(req: ChatRequest):
                     search_results=None,
                 )
             else:
-                # Handle other errors
-                logger.error(f"Error running agent: {e}")
-                error_msg = "I'm having trouble processing your request right now. Please try again."
+                # Handle other errors with more detailed logging
+                import traceback
+                traceback.print_exc()
+                
+                error_msg = f"I'm having trouble processing your request right now. Please try again. (Error: {error_type})"
                 return ChatResponse(
                     conversation_id=conversation_id,
                     current_agent=getattr(current_agent, "name", "person_search_agent"),
@@ -350,44 +381,50 @@ async def chat_endpoint(req: ChatRequest):
 
         # Process all new items from the agent response
         for item in getattr(result, 'new_items', []):
-            if hasattr(item, 'agent') and hasattr(item.agent, 'name'):
-                agent_name = item.agent.name
-            else:
-                agent_name = getattr(current_agent, "name", "person_search_agent")
+            try:
+                if hasattr(item, 'agent') and hasattr(item.agent, 'name'):
+                    agent_name = item.agent.name
+                else:
+                    agent_name = getattr(current_agent, "name", "person_search_agent")
+                    
+                item_type = str(type(item).__name__)
                 
-            if "MessageOutputItem" in str(type(item)):
-                text = ItemHelpers.text_message_output(item) if hasattr(ItemHelpers, 'text_message_output') else str(item)
-                messages.append(MessageResponse(content=text, agent=agent_name))
-                events.append(AgentEvent(
-                    id=uuid4().hex, 
-                    type="message", 
-                    agent=agent_name, 
-                    content=text,
-                    timestamp=time.time() * 1000
-                ))
-            elif "ToolCallItem" in str(type(item)):
-                tool_name = getattr(getattr(item, 'raw_item', None), "name", "tool_call")
-                events.append(
-                    AgentEvent(
-                        id=uuid4().hex,
-                        type="tool_call",
-                        agent=agent_name,
-                        content=tool_name,
-                        metadata={"tool_name": tool_name},
-                        timestamp=time.time() * 1000,
+                if "MessageOutputItem" in item_type:
+                    text = ItemHelpers.text_message_output(item) if hasattr(ItemHelpers, 'text_message_output') else str(item)
+                    messages.append(MessageResponse(content=text, agent=agent_name))
+                    events.append(AgentEvent(
+                        id=uuid4().hex, 
+                        type="message", 
+                        agent=agent_name, 
+                        content=text,
+                        timestamp=time.time() * 1000
+                    ))
+                elif "ToolCallItem" in item_type:
+                    tool_name = getattr(getattr(item, 'raw_item', None), "name", "tool_call")
+                    events.append(
+                        AgentEvent(
+                            id=uuid4().hex,
+                            type="tool_call",
+                            agent=agent_name,
+                            content=tool_name,
+                            metadata={"tool_name": tool_name},
+                            timestamp=time.time() * 1000,
+                        )
                     )
-                )
-            elif "ToolCallOutputItem" in str(type(item)):
-                events.append(
-                    AgentEvent(
-                        id=uuid4().hex,
-                        type="tool_output",
-                        agent=agent_name,
-                        content=str(getattr(item, 'output', '')),
-                        metadata={"tool_result": getattr(item, 'output', None)},
-                        timestamp=time.time() * 1000,
+                elif "ToolCallOutputItem" in item_type:
+                    events.append(
+                        AgentEvent(
+                            id=uuid4().hex,
+                            type="tool_output",
+                            agent=agent_name,
+                            content=str(getattr(item, 'output', '')),
+                            metadata={"tool_result": getattr(item, 'output', None)},
+                            timestamp=time.time() * 1000,
+                        )
                     )
-                )
+            except Exception as item_error:
+                logger.error(f"Error processing item {item}: {item_error}")
+                continue
 
         # Update conversation state with new context
         if hasattr(result, 'context_wrapper') and result.context_wrapper:
@@ -421,11 +458,14 @@ async def chat_endpoint(req: ChatRequest):
         
     except Exception as e:
         logger.error(f"Unexpected error in chat endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        
         return ChatResponse(
             conversation_id=req.conversation_id or uuid4().hex,
             current_agent="person_search_agent",
             messages=[MessageResponse(
-                content="I'm experiencing technical difficulties. Please try again later.",
+                content=f"I'm experiencing technical difficulties. Please try again later. (Error: {str(e)})",
                 agent="person_search_agent"
             )],
             events=[],
@@ -438,6 +478,19 @@ async def chat_endpoint(req: ChatRequest):
 # =========================
 # Additional Endpoints
 # =========================
+
+@app.get("/test")
+async def test_endpoint():
+    """Simple test endpoint to verify deployment"""
+    return {
+        "status": "OK",
+        "message": "API is running",
+        "environment": {
+            "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
+            "has_enformion_name": bool(os.getenv("ENFORMION_AP_NAME")),
+            "has_enformion_password": bool(os.getenv("ENFORMION_AP_PASSWORD"))
+        }
+    }
 
 @app.get("/health")
 async def health_check():
@@ -476,28 +529,59 @@ print("✓ FastAPI app created and configured")
 @app.post("/debug/enformion")
 async def debug_enformion_raw(request: dict):
     """
-    Debug endpoint to get raw EnformionGo API response
+    Debug endpoint to get raw EnformionGo API response with proper pagination
     
-    Request body:
+    Request body (supports both formats):
     {
         "first_name": "Jennifer",
-        "last_name": "Diaz", 
+        "last_name": "Andrus", 
         "city": "Lancaster",
-        "state": "California"
+        "state": "CA",
+        "age": 45,
+        "ResultsPerPage": 5,     # EnformionGo native format
+        "Page": 1                # EnformionGo native format
+    }
+    
+    OR legacy format:
+    {
+        "first_name": "Jennifer",
+        "last_name": "Andrus", 
+        "state": "CA",
+        "limit": 5,              # Converted to ResultsPerPage
+        "page": 1                # Converted to Page
     }
     """
     try:
         from enformion_api import create_enformion_client, PersonSearchParams
         
-        # Extract search parameters
-        first_name = request.get("first_name", "")
-        last_name = request.get("last_name", "")
-        city = request.get("city")
-        state = request.get("state")
-        age = request.get("age")
+        # Extract search parameters - support both native and legacy formats
+        first_name = request.get("first_name", "") or request.get("FirstName", "")
+        last_name = request.get("last_name", "") or request.get("LastName", "")
+        city = request.get("city") or request.get("City")
+        state = request.get("state") or request.get("State")
+        age = request.get("age") or request.get("Age")
         
+        # Handle pagination parameters - prefer EnformionGo native format
+        results_per_page = request.get("ResultsPerPage") or request.get("limit", 10)
+        page = request.get("Page") or request.get("page", 1)
+        
+        # Ensure they're integers
+        try:
+            results_per_page = int(results_per_page)
+            page = int(page)
+        except (ValueError, TypeError):
+            return {"error": "ResultsPerPage and Page must be integers"}
+        
+        # Validate required parameters
         if not first_name or not last_name:
-            return {"error": "first_name and last_name are required"}
+            return {"error": "first_name and last_name (or FirstName and LastName) are required"}
+        
+        # Validate pagination parameters
+        if results_per_page < 1 or results_per_page > 50:
+            return {"error": "ResultsPerPage must be between 1 and 50"}
+        
+        if page < 1:
+            return {"error": "Page must be >= 1"}
         
         # Create search parameters
         search_params = PersonSearchParams(
@@ -515,20 +599,19 @@ async def debug_enformion_raw(request: dict):
             return {
                 "error": "EnformionGo client not configured",
                 "message": "Missing ENFORMION_AP_NAME or ENFORMION_AP_PASSWORD environment variables",
-                "using_mock": True,
-                "mock_data": "Would return mock data here"
+                "debug_info": {
+                    "ENFORMION_AP_NAME": "SET" if os.getenv("ENFORMION_AP_NAME") else "MISSING",
+                    "ENFORMION_AP_PASSWORD": "SET" if os.getenv("ENFORMION_AP_PASSWORD") else "MISSING"
+                },
+                "using_mock": False
             }
         
-        # Make raw API call and capture response
-        import httpx
-        from datetime import datetime
-        
-        # Build the exact same request that would be sent to EnformionGo
+        # Build the exact EnformionGo API payload
         payload = {
             "FirstName": search_params.first_name,
             "LastName": search_params.last_name,
-            "Page": 1,
-            "ResultsPerPage": 2,
+            "Page": page,
+            "ResultsPerPage": results_per_page,
             "Includes": [
                 "Addresses", 
                 "PhoneNumbers", 
@@ -539,9 +622,12 @@ async def debug_enformion_raw(request: dict):
             ]
         }
         
-        # Add optional parameters
+        # Add middle name if provided
+        if hasattr(search_params, 'middle_name') and search_params.middle_name:
+            payload["MiddleName"] = search_params.middle_name
+        
+        # Add location information
         if search_params.city or search_params.state:
-            addresses = []
             address_line2_parts = []
             
             if search_params.city:
@@ -550,16 +636,25 @@ async def debug_enformion_raw(request: dict):
                 address_line2_parts.append(search_params.state)
                 
             if address_line2_parts:
-                addresses.append({
+                payload["Addresses"] = [{
                     "AddressLine2": ", ".join(address_line2_parts)
-                })
-                payload["Addresses"] = addresses
+                }]
         
+        # Add age if provided
         if search_params.age:
-            payload["Age"] = search_params.age
+            try:
+                payload["Age"] = int(search_params.age)
+            except (ValueError, TypeError):
+                return {"error": "Age must be a valid integer"}
         
         # Make the actual API call
         try:
+            import httpx
+            from datetime import datetime
+            
+            # Create session ID for debugging
+            session_id = f"debug_session_{int(datetime.now().timestamp())}"
+            
             async with httpx.AsyncClient(
                 timeout=30,
                 headers={
@@ -569,33 +664,150 @@ async def debug_enformion_raw(request: dict):
                     "galaxy-ap-password": enformion_client.config.ap_password,
                     "galaxy-search-type": enformion_client.config.search_type,
                     "galaxy-client-type": enformion_client.config.client_type,
-                    "galaxy-client-session-id": f"debug_session_{int(datetime.now().timestamp())}"
+                    "galaxy-client-session-id": session_id
                 }
             ) as client:
+                
+                # Log the request for debugging
+                print(f"🔍 EnformionGo API Request:")
+                print(f"   URL: {enformion_client.config.base_url}/PersonSearch")
+                print(f"   Payload: {payload}")
+                print(f"   Session ID: {session_id}")
                 
                 response = await client.post(
                     f"{enformion_client.config.base_url}/PersonSearch",
                     json=payload
                 )
                 
-                return {
-                    "request_payload": payload,
+                print(f"🔍 EnformionGo API Response: {response.status_code}")
+                
+                # Build response data
+                response_data = {
+                    "debug_info": {
+                        "request_payload_sent": payload,
+                        "request_headers_sent": {
+                            "galaxy-search-type": enformion_client.config.search_type,
+                            "galaxy-client-type": enformion_client.config.client_type,
+                            "galaxy-client-session-id": session_id
+                        },
+                        "api_endpoint": f"{enformion_client.config.base_url}/PersonSearch"
+                    },
                     "response_status": response.status_code,
                     "response_headers": dict(response.headers),
-                    "raw_response": response.text,
-                    "parsed_json": response.json() if response.status_code == 200 else None,
+                    "raw_response_text": response.text[:1000] + "..." if len(response.text) > 1000 else response.text,
                     "config": {
                         "base_url": enformion_client.config.base_url,
                         "search_type": enformion_client.config.search_type,
+                        "client_type": enformion_client.config.client_type,
                         "ap_name": enformion_client.config.ap_name,
                         "ap_password": "***" # Don't expose password
                     }
                 }
                 
+                # Try to parse JSON if successful
+                if response.status_code == 200:
+                    try:
+                        parsed_json = response.json()
+                        response_data["parsed_json"] = parsed_json
+                        
+                        # Add detailed summary info
+                        if isinstance(parsed_json, dict):
+                            # Check for persons array
+                            if "persons" in parsed_json:
+                                persons = parsed_json.get("persons", [])
+                                response_data["summary"] = {
+                                    "total_persons_returned": len(persons),
+                                    "requested_results_per_page": results_per_page,
+                                    "requested_page": page,
+                                    "pagination_working": len(persons) <= results_per_page,
+                                    "response_structure": "persons array found"
+                                }
+                                
+                                # Show structure of first person if available
+                                if persons and len(persons) > 0:
+                                    first_person = persons[0]
+                                    if isinstance(first_person, dict):
+                                        response_data["first_person_sample"] = {
+                                            "available_fields": sorted(list(first_person.keys())),
+                                            "name_structure": first_person.get("name", "No name field"),
+                                            "age": first_person.get("age", "No age field"),
+                                            "addresses_count": len(first_person.get("addresses", [])),
+                                            "phone_numbers_count": len(first_person.get("phoneNumbers", [])),
+                                            "email_addresses_count": len(first_person.get("emailAddresses", []))
+                                        }
+                            else:
+                                # Look for other possible structures
+                                response_data["summary"] = {
+                                    "response_structure": "No 'persons' array found",
+                                    "top_level_keys": sorted(list(parsed_json.keys())),
+                                    "requested_results_per_page": results_per_page,
+                                    "requested_page": page
+                                }
+                        else:
+                            response_data["summary"] = {
+                                "response_structure": f"Unexpected response type: {type(parsed_json)}",
+                                "requested_results_per_page": results_per_page,
+                                "requested_page": page
+                            }
+                                
+                    except Exception as parse_error:
+                        response_data["json_parse_error"] = str(parse_error)
+                        response_data["summary"] = {
+                            "error": "Failed to parse JSON response",
+                            "requested_results_per_page": results_per_page,
+                            "requested_page": page
+                        }
+                elif response.status_code == 400:
+                    response_data["error_details"] = {
+                        "message": "Bad Request - Check your payload parameters",
+                        "likely_cause": "Invalid search parameters or missing required fields"
+                    }
+                elif response.status_code == 401:
+                    response_data["error_details"] = {
+                        "message": "Unauthorized - Check your API credentials",
+                        "likely_cause": "Invalid galaxy-ap-name or galaxy-ap-password"
+                    }
+                elif response.status_code == 403:
+                    response_data["error_details"] = {
+                        "message": "Forbidden - Check your API permissions",
+                        "likely_cause": "Account doesn't have access to PersonSearch endpoint"
+                    }
+                else:
+                    response_data["error_details"] = {
+                        "message": f"HTTP {response.status_code} error",
+                        "likely_cause": "Server error or network issue"
+                    }
+                
+                return response_data
+                
         except httpx.TimeoutException:
-            return {"error": "Request timeout", "message": "EnformionGo API did not respond in time"}
+            return {
+                "error": "Request timeout", 
+                "message": "EnformionGo API did not respond within 30 seconds",
+                "debug_info": {
+                    "request_payload": payload,
+                    "timeout_duration": 30
+                }
+            }
+        except httpx.ConnectError:
+            return {
+                "error": "Connection failed", 
+                "message": "Could not connect to EnformionGo API",
+                "debug_info": {
+                    "api_url": f"{enformion_client.config.base_url}/PersonSearch",
+                    "request_payload": payload
+                }
+            }
         except Exception as e:
-            return {"error": "API call failed", "message": str(e)}
+            import traceback
+            return {
+                "error": "API call failed", 
+                "message": str(e),
+                "debug_info": {
+                    "request_payload": payload,
+                    "full_traceback": traceback.format_exc()
+                }
+            }
         
     except Exception as e:
         import traceback
@@ -605,30 +817,7 @@ async def debug_enformion_raw(request: dict):
             "traceback": traceback.format_exc()
         }
 
-@app.get("/debug/enformion/config")
-async def debug_enformion_config():
-    """Check EnformionGo configuration"""
-    import os
-    from enformion_api import create_enformion_client
-    
-    client = create_enformion_client()
-    
-    return {
-        "configured": client is not None,
-        "environment_variables": {
-            "ENFORMION_AP_NAME": "SET" if os.getenv("ENFORMION_AP_NAME") else "MISSING",
-            "ENFORMION_AP_PASSWORD": "SET" if os.getenv("ENFORMION_AP_PASSWORD") else "MISSING",
-            "ENFORMION_BASE_URL": os.getenv("ENFORMION_BASE_URL", "DEFAULT"),
-            "ENFORMION_SEARCH_TYPE": os.getenv("ENFORMION_SEARCH_TYPE", "DEFAULT")
-        },
-        "config": {
-            "base_url": client.config.base_url if client else None,
-            "search_type": client.config.search_type if client else None,
-            "max_results": client.config.max_results if client else None
-        } if client else None
-    }
-
 if __name__ == "__main__":
     import uvicorn
     print("Starting server...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)  # Use port 8080 for Cloud Run

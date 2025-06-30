@@ -5,6 +5,12 @@ from pydantic import BaseModel
 import string
 import json
 from typing import Optional, List, Dict, Any
+import openai
+import os
+from openai import AsyncOpenAI
+import hashlib
+import re
+from datetime import datetime
 
 from agents import (
     Agent,
@@ -25,10 +31,73 @@ load_dotenv()
 from enformion_api import (
     create_enformion_client,
     PersonSearchParams,
-    enformion_to_search_result,
-    create_mock_enformion_results
+    enformion_to_search_result
 )
 
+ENHANCED_PERSON_ANALYSIS_PROMPT = """
+You are an expert people search analyst with 15+ years of experience. Your job is to analyze search results and provide actionable insights to help users determine if they've found the right person.
+
+## SEARCH CONTEXT
+Original Query: "{original_query}"
+Relationship: {relationship}
+Additional Context: {additional_context}
+Expected Location: {expected_location}
+
+## PERSON DATA TO ANALYZE
+{person_data}
+
+## ANALYSIS FRAMEWORK
+
+### 1. MATCH PROBABILITY ASSESSMENT
+Calculate the likelihood this is the correct person based on:
+- Timeline alignment (graduation years, age expectations)
+- Geographic patterns (movement that makes sense)
+- Data quality and consistency
+- Contextual clues from the search
+
+### 2. INTELLIGENT INSIGHTS
+Provide specific, actionable insights:
+- What makes this person a strong/weak match?
+- Are there red flags or confirming factors?
+- What additional verification might help?
+
+### 3. CONFIDENCE SCORING
+Rate confidence as:
+- HIGH (85-100%): Very likely the right person, multiple confirming factors
+- MEDIUM (60-84%): Possible match, some confirming factors but gaps exist
+- LOW (0-59%): Unlikely match, significant misalignments or lack of data
+
+## OUTPUT FORMAT (Be conversational but analytical)
+
+🎯 **Match Assessment: [HIGH/MEDIUM/LOW] Confidence**
+
+**Why this person [is likely/might be/is unlikely to be] your [relationship]:**
+[2-3 sentences explaining the key factors that support or contradict this being a match]
+
+**Geographic Pattern Analysis:**
+[Analyze if their location history makes sense for your search context]
+
+**Timeline Verification:**
+[Check if age/graduation timeline aligns with expectations]
+
+**Data Quality & Verification:**
+[Comment on how much data is available and what it tells us]
+
+**🔍 Bottom Line:**
+[Clear recommendation: "This looks like a strong match because..." or "This is probably not the right person because..." or "This could be a match but needs verification because..."]
+
+**💡 Next Steps:**
+[Suggest what the user should do: contact them, look for more verification, try different search terms, etc.]
+
+## IMPORTANT GUIDELINES
+- Be honest about limitations in the data
+- Don't overstate confidence when data is sparse
+- Focus on practical insights that help decision-making
+- Use conversational language, not robotic analysis
+- If age/timeline doesn't match, be clear about that
+- Consider cultural factors (name variations, geographic mobility)
+- Flag obvious mismatches clearly
+"""
 # =========================
 # CONTEXT
 # =========================
@@ -142,7 +211,8 @@ async def update_search_criteria(
     description_override="Search for a person using the collected criteria via EnformionGo API."
 )
 async def search_person(
-    context: RunContextWrapper[PersonSearchContext]
+    context: RunContextWrapper[PersonSearchContext],
+    limit: Optional[int] = 5  # Add limit parameter
 ) -> str:
     """Search for a person using EnformionGo API - REAL DATA ONLY."""
     ctx = context.context
@@ -185,8 +255,12 @@ Would you like me to provide links to free public directory sites instead?
 """
     
     try:
-        # Make real API call
-        response = await enformion_client.search_person(search_params)
+        # Make real API call with pagination support
+        response = await enformion_client.search_person(
+            search_params, 
+            page=1, 
+            results_per_page=limit or 5  # Default to 5 if no limit specified
+        )
         await enformion_client.close()
         
         if not response.success:
@@ -241,49 +315,15 @@ No matches were found for your search criteria.
         ctx.results = search_results
         ctx.search_performed = True
         
-        # Format results for user - FREE TIER (AI Preview)
-        results_summary = f"Found {len(search_results)} potential matches:\n\n"
+        # Format results for user - FREE TIER (AI Preview) with Enhanced Analysis
+        original_query = f"{ctx.first_name} {ctx.last_name}"
         
-        for i, result in enumerate(search_results, 1):
-            results_summary += f"#{i} - {result['confidence']}% Match Confidence\n"
-            results_summary += f"   {result['first_name']} {result['last_name']}\n"
-            
-            # Show location
-            if result['city'] and result['state']:
-                results_summary += f"   📍 {result['city']}, {result['state']}\n"
-            elif result['state']:
-                results_summary += f"   📍 {result['state']}\n"
-            
-            # Show age range for privacy
-            age = result.get('age', 0)
-            if age > 0:
-                age_range_start = (age // 5) * 5
-                age_range_end = age_range_start + 4
-                results_summary += f"   👤 Age range: {age_range_start}-{age_range_end}\n"
-            
-            # Timeline analysis
-            results_summary += f"   🤖 AI Analysis: {result['timeline_match']}\n"
-            
-            # Professional background (only if real data exists)
-            if result.get('professional_background'):
-                results_summary += f"   💼 {result['professional_background']}\n"
-            
-            # Verification count
-            verification_count = 0
-            if result.get('phone_numbers'):
-                verification_count += len(result['phone_numbers'])
-            if result.get('previous_addresses'):
-                verification_count += len(result['previous_addresses'])
-            if result.get('relatives'):
-                verification_count += len(result['relatives'])
-            
-            if verification_count > 0:
-                results_summary += f"   ✓ Verified across {verification_count} data points\n"
-            
-            results_summary += "\n"
+        results_summary = await format_search_results_with_enhanced_ai(
+            search_results, ctx, original_query
+        )
         
         # Add monetization
-        results_summary += "💳 **Get Full Contact Information**\n"
+        results_summary += "\n\n💳 **Get Full Contact Information**\n"
         results_summary += "For complete details including phone numbers, email addresses, and full address history:\n\n"
         results_summary += "🔹 **Lite Report ($5)** - Full contact info, address history, known relatives\n"
         results_summary += "🔹 **Premium Membership ($19.95/month)** - Unlimited searches, background data, monitoring\n\n"
@@ -371,6 +411,40 @@ async def refine_search(
     ctx.results = None
     
     return f"Search refined with {refinement_type}: {value}. Ready to search again with updated criteria."
+
+async def format_search_results_with_enhanced_ai(search_results, ctx, original_query):
+    """Format search results with enhanced AI analysis"""
+    
+    search_context = {
+        "relationship": ctx.relationship,
+        "additional_context": ctx.additional_context,
+        "location": f"{ctx.current_city}, {ctx.current_state}" if ctx.current_city else ctx.current_state
+    }
+    
+    if len(search_results) == 1:
+        # Single result - detailed analysis
+        analysis = await generate_enhanced_person_analysis_with_cache(
+            person=search_results[0],
+            original_query=original_query,
+            search_context=search_context
+        )
+        results_summary = f"I found 1 potential match:\n\n{analysis}"
+    else:
+        # Multiple results - analyze top 2-3
+        results_summary = f"I found {len(search_results)} potential matches. Here are the top candidates:\n\n"
+        
+        for i, person in enumerate(search_results[:3], 1):  # Analyze top 3
+            analysis = await generate_enhanced_person_analysis_with_cache(
+                person=person,
+                original_query=original_query,
+                search_context=search_context
+            )
+            results_summary += f"## Candidate #{i}\n{analysis}\n\n---\n\n"
+        
+        if len(search_results) > 3:
+            results_summary += f"There are {len(search_results) - 3} additional results. Would you like me to analyze more candidates?\n\n"
+    
+    return results_summary
 
 @function_tool(
     name_override="purchase_lite_report",
@@ -605,6 +679,222 @@ async def safety_guardrail(
 # AGENTS
 # =========================
 
+def _generate_enhanced_fallback_analysis(person: Dict, search_context: Dict = None) -> str:
+    """Enhanced fallback analysis when ChatGPT API is unavailable"""
+    
+    # Extract key information
+    name = f"{person.get('first_name', '')} {person.get('last_name', '')}".strip()
+    age = person.get('age', 'unknown')
+    location = f"{person.get('city', '')}, {person.get('state', '')}".strip()
+    confidence = person.get('confidence', 0)
+    
+    # Determine confidence level with reasoning
+    if confidence >= 85:
+        confidence_level = "HIGH"
+        confidence_reason = "strong data consistency across multiple sources"
+    elif confidence >= 60:
+        confidence_level = "MEDIUM" 
+        confidence_reason = "some matching factors but gaps in verification"
+    else:
+        confidence_level = "LOW"
+        confidence_reason = "limited data or significant misalignments"
+    
+    # Analyze timeline if context available
+    timeline_analysis = ""
+    if search_context and search_context.get("additional_context"):
+        context = search_context.get("additional_context", "")
+        import re
+        grad_match = re.search(r'graduated.*?(\d{4})', context)
+        if grad_match and person.get('age'):
+            graduation_year = int(grad_match.group(1))
+            current_year = 2025
+            expected_age = current_year - graduation_year + 22  # Assume college
+            age_diff = abs(person.get('age') - expected_age)
+            
+            if age_diff <= 2:
+                timeline_analysis = f"✅ **Timeline Match**: Age {age} aligns well with {graduation_year} graduation (expected ~{expected_age})"
+            else:
+                timeline_analysis = f"⚠️ **Timeline Concern**: Age {age} doesn't align with {graduation_year} graduation (expected ~{expected_age})"
+    
+    # Geographic analysis
+    geo_analysis = ""
+    if person.get('previous_addresses'):
+        addr_count = len(person.get('previous_addresses', []))
+        if addr_count > 3:
+            geo_analysis = "Shows significant geographic mobility with detailed address history"
+        elif addr_count > 0:
+            geo_analysis = "Limited address history available"
+        else:
+            geo_analysis = "No previous address history in records"
+    
+    # Professional analysis
+    prof_analysis = ""
+    if person.get('professional_background'):
+        prof_analysis = f"Professional background: {person.get('professional_background')}"
+    else:
+        prof_analysis = "No professional information available in current records"
+    
+    # Build the analysis
+    analysis = f"""🎯 **Match Assessment: {confidence_level} Confidence**
+
+**Why this person {"is likely" if confidence >= 85 else "might be" if confidence >= 60 else "is unlikely to be"} your {search_context.get('relationship', 'target person') if search_context else 'target person'}:**
+Found {name}, age {age}, in {location}. Confidence is {confidence_level.lower()} due to {confidence_reason}. {"Strong data verification across multiple databases." if confidence >= 85 else "Some verification but could use additional confirmation." if confidence >= 60 else "Limited verification - proceed with caution."}
+
+**Geographic Pattern Analysis:**
+{geo_analysis}
+
+{timeline_analysis}
+
+**Data Quality & Verification:**
+{len(person.get("phone_numbers", []))} phone numbers, {len(person.get("email_addresses", []))} email addresses, and {len(person.get("relatives", []))} family connections in database. {prof_analysis}
+
+**🔍 Bottom Line:**
+{"This looks like a strong match with good data verification." if confidence >= 85 else "This could be the right person but needs additional verification." if confidence >= 60 else "This is probably not the right person due to data misalignments or insufficient information."}
+
+**💡 Next Steps:**
+{"Contact them directly - the data strongly supports this being the right person." if confidence >= 85 else "Try cross-referencing with social media or mutual connections before reaching out." if confidence >= 60 else "Continue searching with different criteria or try alternative search methods."}"""
+
+    return analysis
+
+async def generate_enhanced_person_analysis(person: Dict, original_query: str, search_context: Dict) -> str:
+    """
+    Generate enhanced AI analysis for a single person using ChatGPT with improved prompting
+    """
+    
+    # Extract and structure the data for better AI analysis
+    person_summary = {
+        "name": f"{person.get('first_name', '')} {person.get('last_name', '')}".strip(),
+        "age": person.get("age"),
+        "current_location": f"{person.get('city', '')}, {person.get('state', '')}".strip(),
+        "previous_locations": person.get("previous_addresses", []),
+        "contact_data_available": {
+            "phone_numbers": len(person.get("phone_numbers", [])),
+            "email_addresses": len(person.get("email_addresses", [])),
+            "addresses": len(person.get("previous_addresses", []))
+        },
+        "family_connections": len(person.get("relatives", [])),
+        "professional_info": person.get("professional_background", "Not available"),
+        "timeline_analysis": person.get("timeline_match", ""),
+        "confidence_score": f"{person.get('confidence', 0)}%"
+    }
+    
+    # Format the enhanced prompt
+    prompt = ENHANCED_PERSON_ANALYSIS_PROMPT.format(
+        original_query=original_query,
+        relationship=search_context.get("relationship", "person you're looking for"),
+        additional_context=search_context.get("additional_context", "No additional context provided"),
+        expected_location=search_context.get("location", "Location not specified"),
+        person_data=json.dumps(person_summary, indent=2)
+    )
+    
+    # Try OpenAI API first
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("⚠️ OpenAI API key not found, using fallback analysis")
+        return _generate_enhanced_fallback_analysis(person, search_context)
+    
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",  # Fast and cost-effective
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are an expert people search analyst. Provide practical, honest analysis that helps users make decisions about whether they've found the right person. Be conversational but thorough."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            max_tokens=600,  # Increased for more detailed analysis
+            temperature=0.3,  # Balanced between consistency and natural language
+            presence_penalty=0.1,  # Slight penalty to avoid repetition
+            frequency_penalty=0.1
+        )
+        
+        analysis = response.choices[0].message.content.strip()
+        
+        # Validate that we got a reasonable response
+        if len(analysis) < 50:
+            print("⚠️ OpenAI returned very short response, using fallback")
+            return _generate_enhanced_fallback_analysis(person, search_context)
+            
+        return analysis
+        
+    except Exception as e:
+        print(f"❌ OpenAI API error: {e}")
+        return _generate_enhanced_fallback_analysis(person, search_context)
+
+@function_tool(
+    name_override="test_enhanced_analysis",
+    description_override="Test the enhanced AI analysis system."
+)
+async def test_enhanced_analysis(
+    context: RunContextWrapper[PersonSearchContext]
+) -> str:
+    """Test endpoint for the enhanced analysis"""
+    
+    # Create test person data
+    test_person = {
+        "first_name": "Sarah",
+        "last_name": "Johnson", 
+        "age": 32,
+        "city": "Denver",
+        "state": "CO",
+        "confidence": 85,
+        "timeline_match": "Timeline aligns with college graduation around 2010-2015",
+        "professional_background": "Marketing professional based on email domain",
+        "phone_numbers": ["(303) 555-0123"],
+        "email_addresses": ["sarah.j@company.com"],
+        "previous_addresses": ["Boulder, CO", "Fort Collins, CO"],
+        "relatives": ["John Johnson", "Mary Johnson"]
+    }
+    
+    analysis = await generate_enhanced_person_analysis(
+        person=test_person,
+        original_query="Looking for college roommate Sarah Johnson",
+        search_context={
+            "relationship": "college roommate",
+            "additional_context": "graduated around 2012",
+            "location": "Colorado"
+        }
+    )
+    
+    return f"🧪 **Enhanced Analysis Test**\n\n{analysis}"
+
+# Simple in-memory cache for AI analysis
+_analysis_cache: Dict[str, str] = {}
+
+def _get_cache_key(person: Dict, original_query: str, search_context: Dict) -> str:
+    """Generate cache key for analysis results"""
+    cache_data = {
+        "name": f"{person.get('first_name', '')} {person.get('last_name', '')}",
+        "age": person.get('age'),
+        "location": f"{person.get('city', '')}, {person.get('state', '')}",
+        "query": original_query,
+        "context": search_context.get('relationship', '') + search_context.get('additional_context', '')
+    }
+    return hashlib.md5(json.dumps(cache_data, sort_keys=True).encode()).hexdigest()
+
+async def generate_enhanced_person_analysis_with_cache(person: Dict, original_query: str, search_context: Dict) -> str:
+    """Generate analysis with caching to reduce API costs"""
+    
+    cache_key = _get_cache_key(person, original_query, search_context)
+    
+    # Check cache first
+    if cache_key in _analysis_cache:
+        return _analysis_cache[cache_key]
+    
+    # Generate new analysis
+    analysis = await generate_enhanced_person_analysis(person, original_query, search_context)
+    
+    # Cache the result
+    _analysis_cache[cache_key] = analysis
+    
+    return analysis
+
 # FIXED: Make instructions more explicit about ALWAYS calling update_search_criteria
 person_search_instructions = f"""
 {RECOMMENDED_PROMPT_PREFIX}
@@ -650,6 +940,6 @@ person_search_agent = Agent[PersonSearchContext](
     name="Person Search Agent",
     model="gpt-4o",
     instructions=person_search_instructions,
-    tools=[update_search_criteria, search_person, refine_search, purchase_lite_report, upgrade_to_premium],
+    tools=[update_search_criteria, search_person, refine_search, purchase_lite_report, upgrade_to_premium, test_enhanced_analysis],
     input_guardrails=[relevance_guardrail, safety_guardrail],
 )
